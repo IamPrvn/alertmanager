@@ -14,14 +14,14 @@
 package notify
 
 import (
-	"bytes"
-	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
 	"github.com/cenkalti/backoff"
+	"github.com/cespare/xxhash"
 	"github.com/golang/protobuf/ptypes"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
@@ -206,7 +206,7 @@ func createStage(rc *config.Receiver, tmpl *template.Template, wait func() time.
 		}
 		var s MultiStage
 		s = append(s, NewWaitStage(wait))
-		s = append(s, NewDedupStage(notificationLog, recv))
+		s = append(s, NewDedupStage(notificationLog, recv, i.conf.SendResolved()))
 		s = append(s, NewRetryStage(i))
 		s = append(s, NewSetNotifiesStage(notificationLog, recv))
 
@@ -382,26 +382,22 @@ func (ws *WaitStage) Exec(ctx context.Context, alerts ...*types.Alert) (context.
 // DedupStage filters alerts.
 // Filtering happens based on a notification log.
 type DedupStage struct {
-	nflog nflog.Log
-	recv  *nflogpb.Receiver
+	nflog        nflog.Log
+	recv         *nflogpb.Receiver
+	sendResolved bool
 
-	// TODO(fabxc): consider creating an AlertBatch type received
-	// by stages that implements these functions.
-	// This can then also handle caching so we can skip passing
-	// the hash around as a context.
-	hash     func([]*types.Alert) []byte
-	resolved func([]*types.Alert) bool
-	now      func() time.Time
+	now  func() time.Time
+	hash func(*types.Alert) uint64
 }
 
 // NewDedupStage wraps a DedupStage that runs against the given notification log.
-func NewDedupStage(l nflog.Log, recv *nflogpb.Receiver) *DedupStage {
+func NewDedupStage(l nflog.Log, recv *nflogpb.Receiver, sendResolved bool) *DedupStage {
 	return &DedupStage{
-		nflog:    l,
-		recv:     recv,
-		hash:     hashAlerts,
-		resolved: allAlertsResolved,
-		now:      utcNow,
+		nflog:        l,
+		recv:         recv,
+		now:          utcNow,
+		sendResolved: sendResolved,
+		hash:         hashAlert,
 	}
 }
 
@@ -409,28 +405,24 @@ func utcNow() time.Time {
 	return time.Now().UTC()
 }
 
-// TODO(fabxc): this could get slow, but is fine for now. We may want to
-// have something mor sophisticated at some point.
-// Alternatives are FNV64a as in fingerprints or xxhash.
-func hashAlerts(alerts []*types.Alert) []byte {
-	// The xor'd sum so we don't have to sort the alerts.
-	// XXX(fabxc): this approach caused collision issues with FNV64a in
-	// the past. However, sha256 should not suffer from the bit cancelation
-	// in in small input changes.
-	xsum := [sha256.Size]byte{}
+const sep = '\xff'
 
-	for _, a := range alerts {
-		b := make([]byte, 9)
-		binary.BigEndian.PutUint64(b, uint64(a.Fingerprint()))
-		// Resolved status is part of the identity.
-		if a.Resolved() {
-			b[8] = 1
-		}
-		for i, b := range sha256.Sum256(b) {
-			xsum[i] ^= b
-		}
+func hashAlert(a *types.Alert) uint64 {
+	b := make([]byte, 0, 1024)
+	labelNames := make(model.LabelNames, 0, len(a.Labels))
+
+	for labelName, _ := range a.Labels {
+		labelNames = append(labelNames, labelName)
 	}
-	return xsum[:]
+	sort.Sort(labelNames)
+
+	for _, labelName := range labelNames {
+		b = append(b, string(labelName)...)
+		b = append(b, sep)
+		b = append(b, string(a.Labels[labelName])...)
+		b = append(b, sep)
+	}
+	return xxhash.Sum64(b)
 }
 
 func allAlertsResolved(alerts []*types.Alert) bool {
@@ -442,14 +434,18 @@ func allAlertsResolved(alerts []*types.Alert) bool {
 	return true
 }
 
-func (n *DedupStage) needsUpdate(entry *nflogpb.Entry, hash []byte, resolved bool, repeat time.Duration) (bool, error) {
+func (n *DedupStage) needsUpdate(entry *nflogpb.Entry, firing, resolved map[uint64]struct{}, repeat time.Duration) (bool, error) {
 	// If we haven't notified about the alert group before, notify right away
 	// unless we only have resolved alerts.
 	if entry == nil {
-		return !resolved, nil
+		return ((len(firing) > 0) || (n.sendResolved && len(resolved) > 0)), nil
 	}
-	// Check whether the contents have changed.
-	if !bytes.Equal(entry.GroupHash, hash) {
+
+	if !entry.IsFiringSubset(firing) {
+		return true, nil
+	}
+
+	if n.sendResolved && !entry.IsResolvedSubset(resolved) {
 		return true, nil
 	}
 
@@ -476,10 +472,16 @@ func (n *DedupStage) Exec(ctx context.Context, alerts ...*types.Alert) (context.
 		return ctx, nil, fmt.Errorf("repeat interval missing")
 	}
 
-	hash := n.hash(alerts)
-	resolved := n.resolved(alerts)
+	firing := map[uint64]struct{}{}
+	resolved := map[uint64]struct{}{}
 
-	ctx = WithNotificationHash(ctx, hash)
+	for _, a := range alerts {
+		if a.Resolved() {
+			resolved[n.hash(a)] = struct{}{}
+		} else {
+			firing[n.hash(a)] = struct{}{}
+		}
+	}
 
 	entries, err := n.nflog.Query(nflog.QGroupKey(gkeyb), nflog.QReceiver(n.recv))
 
@@ -494,13 +496,12 @@ func (n *DedupStage) Exec(ctx context.Context, alerts ...*types.Alert) (context.
 	case 2:
 		return ctx, nil, fmt.Errorf("Unexpected entry result size %d", len(entries))
 	}
-	if ok, err := n.needsUpdate(entry, hash, resolved, repeatInterval); err != nil {
+	if ok, err := n.needsUpdate(entry, firing, resolved, repeatInterval); err != nil {
 		return ctx, nil, err
 	} else if ok {
 		return ctx, alerts, nil
 	}
 	return ctx, nil, nil
-
 }
 
 // RetryStage notifies via passed integration with exponential backoff until it
@@ -570,25 +571,20 @@ func (r RetryStage) Exec(ctx context.Context, alerts ...*types.Alert) (context.C
 type SetNotifiesStage struct {
 	nflog nflog.Log
 	recv  *nflogpb.Receiver
-
-	resolved func([]*types.Alert) bool
+	hash  func(*types.Alert) uint64
 }
 
 // NewSetNotifiesStage returns a new instance of a SetNotifiesStage.
 func NewSetNotifiesStage(l nflog.Log, recv *nflogpb.Receiver) *SetNotifiesStage {
 	return &SetNotifiesStage{
-		nflog:    l,
-		recv:     recv,
-		resolved: allAlertsResolved,
+		nflog: l,
+		recv:  recv,
+		hash:  hashAlert,
 	}
 }
 
 // Exec implements the Stage interface.
 func (n SetNotifiesStage) Exec(ctx context.Context, alerts ...*types.Alert) (context.Context, []*types.Alert, error) {
-	hash, ok := NotificationHash(ctx)
-	if !ok {
-		return ctx, nil, fmt.Errorf("notification hash missing")
-	}
 	gkey, ok := GroupKey(ctx)
 	if !ok {
 		return ctx, nil, fmt.Errorf("group key missing")
@@ -596,8 +592,16 @@ func (n SetNotifiesStage) Exec(ctx context.Context, alerts ...*types.Alert) (con
 	gkeyb := make([]byte, 8)
 	binary.BigEndian.PutUint64(gkeyb, uint64(gkey))
 
-	if n.resolved(alerts) {
-		return ctx, alerts, n.nflog.LogResolved(n.recv, gkeyb, hash)
+	firing := []uint64{}
+	resolved := []uint64{}
+
+	for _, a := range alerts {
+		if a.Resolved() {
+			resolved = append(resolved, n.hash(a))
+		} else {
+			firing = append(firing, n.hash(a))
+		}
 	}
-	return ctx, alerts, n.nflog.LogActive(n.recv, gkeyb, hash)
+
+	return ctx, alerts, n.nflog.Log(n.recv, gkeyb, firing, resolved)
 }
